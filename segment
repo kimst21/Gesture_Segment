@@ -1,0 +1,190 @@
+# ============================================================
+# segmenter.py
+# MediaPipe 손 segmentation 모듈
+#
+# 이 모듈은 2편(데이터 수집)과 3편(실시간 추론) 양쪽에서
+# 동일하게 사용됩니다. 학습 도메인과 추론 도메인을 일치시키기
+# 위해 두 편에서 같은 함수를 import해서 사용합니다.
+#
+# 핵심 함수:
+#   segment_hand_to_96x96(frame_bgr, hand_landmarks) → 96x96 BGR 이미지
+#
+# 사용 예시:
+#   from segmenter import segment_hand_to_96x96
+#   segmented = segment_hand_to_96x96(frame, hl)
+#   if segmented is not None:
+#       cv2.imwrite('output.png', segmented)
+# ============================================================
+
+import cv2
+import numpy as np
+
+
+# segmentation 파라미터
+# 이 값들은 2편/3편 양쪽에서 동일해야 도메인이 일치합니다
+CROP_EXPAND_RATIO = 1.4   # bounding box 확장 비율 (1.4 = 40% 여유)
+OUTPUT_SIZE = 96          # 모델 입력 크기 (정사각)
+
+
+def get_hand_bbox(hand_landmarks, frame_w, frame_h):
+    """
+    MediaPipe 21개 랜드마크에서 손 bounding box 계산.
+
+    Parameters
+    ----------
+    hand_landmarks : mediapipe NormalizedLandmarkList
+        MediaPipe Hands가 반환한 21점 랜드마크
+    frame_w, frame_h : int
+        원본 영상의 너비와 높이 (픽셀)
+
+    Returns
+    -------
+    (x_min, y_min, x_max, y_max) : tuple of int
+        손을 둘러싸는 사각형의 픽셀 좌표
+    """
+    # 21점 모든 x, y 좌표를 픽셀 단위로 변환
+    xs = [lm.x * frame_w for lm in hand_landmarks.landmark]
+    ys = [lm.y * frame_h for lm in hand_landmarks.landmark]
+
+    x_min = int(min(xs))
+    x_max = int(max(xs))
+    y_min = int(min(ys))
+    y_max = int(max(ys))
+
+    return x_min, y_min, x_max, y_max
+
+
+def expand_to_square(x_min, y_min, x_max, y_max, expand_ratio=CROP_EXPAND_RATIO):
+    """
+    bounding box를 정사각형으로 확장하고 여유를 추가.
+
+    Parameters
+    ----------
+    x_min, y_min, x_max, y_max : int
+        원본 bounding box
+    expand_ratio : float
+        가로/세로 중 긴 쪽의 확장 비율
+
+    Returns
+    -------
+    (cx, cy, half) : tuple of int
+        정사각 crop의 중심점과 절반 크기
+    """
+    cx = (x_min + x_max) // 2
+    cy = (y_min + y_max) // 2
+
+    # 가로/세로 중 긴 쪽을 기준으로 정사각형
+    side = max(x_max - x_min, y_max - y_min)
+
+    # 여유 추가 (손목/손가락 끝이 잘리지 않도록)
+    side = int(side * expand_ratio)
+    half = side // 2
+
+    return cx, cy, half
+
+
+def crop_with_black_padding(frame_bgr, cx, cy, half):
+    """
+    화면 가장자리를 벗어나는 부분은 검은색으로 채워서 crop.
+
+    Parameters
+    ----------
+    frame_bgr : numpy array (H, W, 3)
+        원본 BGR 영상
+    cx, cy, half : int
+        정사각 crop의 중심점과 절반 크기
+
+    Returns
+    -------
+    cropped : numpy array (2*half, 2*half, 3)
+        crop된 정사각 BGR 이미지 (가장자리는 검은색 padding)
+    """
+    h, w = frame_bgr.shape[:2]
+    side = half * 2
+
+    # 검은 배경 정사각형 먼저 생성
+    cropped = np.zeros((side, side, 3), dtype=np.uint8)
+
+    # 원본에서 가져올 영역 계산 (화면 안쪽으로 클램핑)
+    src_x1 = max(0, cx - half)
+    src_y1 = max(0, cy - half)
+    src_x2 = min(w, cx + half)
+    src_y2 = min(h, cy + half)
+
+    # 검은 배경의 어디에 붙일지 계산
+    dst_x1 = src_x1 - (cx - half)
+    dst_y1 = src_y1 - (cy - half)
+    dst_x2 = dst_x1 + (src_x2 - src_x1)
+    dst_y2 = dst_y1 + (src_y2 - src_y1)
+
+    # 영상 영역 복사 (나머지는 검은색 그대로)
+    if src_x2 > src_x1 and src_y2 > src_y1:
+        cropped[dst_y1:dst_y2, dst_x1:dst_x2] = frame_bgr[src_y1:src_y2, src_x1:src_x2]
+
+    return cropped
+
+
+def segment_hand_to_96x96(frame_bgr, hand_landmarks):
+    """
+    원본 영상과 MediaPipe 손 랜드마크를 받아
+    손 영역만 검은 배경에 합성한 96x96 BGR 이미지를 반환.
+
+    이 함수가 2편 데이터 수집과 3편 실시간 추론에서
+    동일하게 호출되어 학습 도메인과 추론 도메인을 일치시킵니다.
+
+    Parameters
+    ----------
+    frame_bgr : numpy array (H, W, 3)
+        원본 BGR 영상 (OpenCV cv2.VideoCapture 출력 형식)
+    hand_landmarks : mediapipe NormalizedLandmarkList
+        MediaPipe Hands가 반환한 한 손의 21점 랜드마크
+
+    Returns
+    -------
+    segmented : numpy array (96, 96, 3) or None
+        96x96 BGR 이미지. 손 영역이 영상 밖이거나 비정상이면 None
+    """
+    if hand_landmarks is None:
+        return None
+
+    h, w = frame_bgr.shape[:2]
+
+    # 1. 21점에서 bounding box 계산
+    x_min, y_min, x_max, y_max = get_hand_bbox(hand_landmarks, w, h)
+
+    # 손이 너무 작으면 무효 (오인식 가능성)
+    if (x_max - x_min) < 20 or (y_max - y_min) < 20:
+        return None
+
+    # 2. 정사각형으로 확장 + 여유 추가
+    cx, cy, half = expand_to_square(x_min, y_min, x_max, y_max)
+
+    # 너무 작은 crop은 무효
+    if half < 15:
+        return None
+
+    # 3. 화면 가장자리 처리하며 crop
+    cropped = crop_with_black_padding(frame_bgr, cx, cy, half)
+
+    # 4. 96x96으로 리사이즈 (INTER_AREA는 다운샘플링에 가장 적합)
+    resized = cv2.resize(cropped, (OUTPUT_SIZE, OUTPUT_SIZE),
+                         interpolation=cv2.INTER_AREA)
+
+    return resized
+
+
+def to_grayscale(img_bgr):
+    """
+    BGR 이미지를 grayscale로 변환.
+    Edge Impulse가 grayscale 입력으로 학습하므로 저장 전 변환.
+
+    Parameters
+    ----------
+    img_bgr : numpy array (H, W, 3)
+
+    Returns
+    -------
+    gray : numpy array (H, W)
+    """
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
